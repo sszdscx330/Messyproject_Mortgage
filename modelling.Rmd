@@ -1,0 +1,243 @@
+---
+title: "Modeling"
+author: "Ruisi Geng"
+date: "2023-05-09"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# load libraries
+library(dplyr)
+library(tidyr)
+library(stats)
+library(caTools)
+library(glmnet)
+library(MASS)
+library(ranger)
+library(randomForest)
+library(boot)
+library(pROC)
+```
+
+```{r}
+mortgage_join <- read.csv("~/Data/mortgage_join.csv", header=TRUE)
+```
+
+## Data profiling
+```{r}
+# remove unrelated variables by data codebook
+cleaned_mortgage_join <- mortgage_join %>% 
+  dplyr::select(-co.applicant_credit_score_type, -co.applicant_ethnicity.1,
+                                          -co.applicant_ethnicity_observed, -co.applicant_race.1, -rate_spread,
+                                          -co.applicant_race_observed, -county_code, -lei, - derived_msa.md, -census_tract,
+                                          -derived_loan_product_type, -derived_dwelling_category, -conforming_loan_limit,
+                                          -Area_name, -co.applicant_sex, -co.applicant_sex_observed, -negative_amortization,
+                                          -submission_of_application,-applicant_sex_observed, -applicant_ethnicity_observed,
+                                          -applicant_race_observed, -initially_payable_to_institution, -applicant_race.1,
+                                          -other_nonamortizing_features, -aus.1, -applicant_sex, -applicant_ethnicity.1, 
+                                          -manufactured_home_secured_property_type, -derived_ethnicity,
+                                          -applicant_age_above_62, -tract_minority_population_percent,
+                                          -ffiec_msa_md_median_family_income, -Employed_2020, -Unemployed_2020,
+                                          -manufactured_home_land_property_interest, -occupancy_type,
+                                          -applicant_credit_score_type, -tract_to_msa_income_percentage,
+                                          -tract_owner_occupied_units, -tract_one_to_four_family_homes,
+                                          -Median_Household_Income_2020, -denial_reason.1, -open.end_line_of_credit,
+                                          -reverse_mortgage, -lien_status, -tract_median_age_of_housing_units,
+                                          -interest_only_payment, -origination_charges, 
+                                          -Med_HH_Income_Percent_of_State_Total_2020)
+
+
+# convert as factor variables
+categorical_vars <- c("derived_race", "derived_sex", "purchaser_type", "preapproval", "loan_type", 
+                      "loan_purpose","business_or_commercial_purpose", "hoepa_status",
+                      "balloon_payment","construction_method",
+                      "total_units")
+
+cleaned_mortgage_join[categorical_vars] <- lapply(cleaned_mortgage_join[categorical_vars], as.factor)
+```
+
+```{r}
+# downsampling to imbalanced data
+set.seed(123)
+
+action_taken_false <- cleaned_mortgage_join %>%
+  filter(action_taken == 'FALSE')
+
+action_taken_true <- cleaned_mortgage_join %>%
+  filter(action_taken == 'TRUE')
+
+downsampled_action_taken_true <- action_taken_true %>%
+  sample_n(size = nrow(action_taken_false))
+
+downsampled_data <- rbind(action_taken_false, downsampled_action_taken_true)
+
+# Check whether the number of categories of the target variable is balanced
+table(downsampled_data$action_taken)
+```
+
+
+
+```{r}
+# randomly spilt train and test data
+set.seed(123)
+split <- sample.split(downsampled_data$action_taken, SplitRatio = 0.7)
+train <- downsampled_data[split, ]
+dim(train)
+test <- downsampled_data[!split, ]
+dim(test)
+```
+
+
+
+## Saturated Logistic Regression model
+
+```{r}
+# Fit the saturated model
+log_model <- glm(action_taken ~ ., 
+                 data = train, family = binomial())
+
+# Print model summary
+summary(log_model)
+```
+
+
+# model selection method backward stepwise regression
+```{r}
+# Fit logistic regression model using stepwise variable selection
+step_model <- stepAIC(log_model, direction = "backward", trace = FALSE)
+
+# Print summary of stepwise model
+summary(step_model)
+```
+
+
+```{r}
+# Fit logistic regression model using LASSO regularization
+lasso_model <- glmnet(as.matrix(train[, -which(names(train) == "action_taken")]), 
+                      train$action_taken, family = "binomial", alpha = 1, lambda = NULL)
+
+# Plot cross-validated deviance as a function of log(lambda)
+plot(lasso_model)
+
+# Extract coefficients using the optimal lambda value
+lasso_coef <- coef(lasso_model, s = 0.1)
+
+# Remove coefficients that are effectively zero
+lasso_coef <- lasso_coef[-1, ]
+lasso_coef <- lasso_coef[lasso_coef != 0]
+
+# Print coefficients of significant variables
+print(lasso_coef)
+```
+
+
+# Updated Logistic Regression model after using stepAIC method
+```{r}
+new_log_model <- glm(action_taken ~ derived_sex + loan_type + loan_purpose + business_or_commercial_purpose + 
+                       loan_amount + loan_to_value_ratio + interest_rate + total_loan_costs + hoepa_status + 
+                       loan_term + construction_method + total_units+ debt_to_income_ratio + applicant_age + 
+                       Civilian_labor_force_2020 + Unemployment_rate_2020, 
+                     family = binomial(), data = train)
+summary(new_log_model)
+```
+
+
+## Random Forest model
+
+```{r}
+# Fit a random forest model using ranger
+rf_model <- ranger(action_taken ~ ., data = train)
+
+# Print model summary
+print(rf_model)
+
+# Predict on test data
+predictions <- predict(rf_model, data = test)$predictions
+```
+
+
+
+
+## Model Evaluation 
+
+```{r}
+# Make predictions on the test set using the original model
+test$pred_log <- predict(log_model, newdata = test, type = "response")
+
+# Create a confusion matrix for the original model
+table(test$action_taken, test$pred_log > 0.5)
+
+# Calculate the accuracy of the original model
+accuracy_log <- mean(test$action_taken == (test$pred_log > 0.5))
+accuracy_log
+
+# Create a ROC curve for the original model
+library(pROC)
+roc_log <- roc(test$action_taken, test$pred_log)
+plot(roc_log, main = "ROC Curve for Logistic Regression Model")
+
+# Calculate the AUC for the original model
+auc_log <- auc(roc_log)
+auc_log
+
+# Make predictions on the test set using the updated model
+test$pred_new_log <- predict(new_log_model, newdata = test, type = "response")
+
+# Create a confusion matrix for the updated model
+table(test$action_taken, test$pred_new_log > 0.5)
+
+# Calculate the accuracy of the updated model
+accuracy_new_log <- mean(test$action_taken == (test$pred_new_log > 0.5))
+accuracy_new_log
+
+# Create a ROC curve for the updated model
+roc_new_log <- roc(test$action_taken, test$pred_new_log)
+plot(roc_new_log, main = "ROC Curve for Updated Logistic Regression Model")
+
+# Calculate the AUC for the updated model
+auc_new_log <- auc(roc_new_log)
+auc_new_log
+```
+
+
+```{r}
+
+```
+
+
+
+
+```{r}
+
+```
+
+
+
+
+```{r}
+
+```
+
+
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
+
+
+
+```{r}
+
+```
